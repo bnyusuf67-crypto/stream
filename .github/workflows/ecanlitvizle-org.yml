@@ -2,39 +2,41 @@ name: Update ecanlitvizle-org
 
 on:
   schedule:
-    - cron: '0 */2 * * *'  # Run every 6 hours
-  workflow_dispatch:  # Allow manual trigger
+    - cron: '0 * * * *'  # Her saatte bir çalışır
+  workflow_dispatch:      # Manuel tetiklemeye izin verir
 
 permissions:
   contents: write
-  
+
 jobs:
   update:
     runs-on: ubuntu-latest
-    
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
-      
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.x'
-        
+
     - name: Install dependencies
       run: |
         pip install requests beautifulsoup4
 
-        - name: Create directories
-        run: |
-          mkdir -p ecanlitvizle-org
-          
+    - name: Create directories
+      run: |
+        mkdir -p ecanlitvizle-org
+        mkdir -p playlists
+
     - name: Run scraper
       env:
-        GITHUB_USER: ${{ secrets.USER_NAME }}
-        GITHUB_REPO: ${{ secrets.REPO_NAME }}
+        USER_NAME: ${{ secrets.USER_NAME }}
+        REPO_NAME: ${{ secrets.REPO_NAME }}
+        BRANCH_NAME: ${{ github.ref_name }}
       run: python ecanlitvizle-org.py
-      
+
     - name: Commit and push changes
       run: |
         git config --local user.email "github-actions[bot]@users.noreply.github.com"
@@ -42,6 +44,6 @@ jobs:
         git add ecanlitvizle-org/ playlists/
         git diff --quiet && git diff --staged --quiet || {
           git commit -m "Auto-update M3U8 streams - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-          git pull --rebase origin main
+          git pull --rebase origin ${{ github.ref_name }}
           git push
         }
