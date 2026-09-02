@@ -162,7 +162,7 @@ async def get_stream_urls(session: aiohttp.ClientSession, param: str, yayin: int
     if yayin > 3 or not param:
         return None
 
-    url = f"https://tv.ecanlitvizle.org/embed.php?kanal={param}&yayin={yayin}"
+    url = f"https://www.ecanlitvizle.live//embed.php?kanal={param}&yayin={yayin}"
     async with semaphore:
         try:
             async with session.get(url, headers=HEADERS, timeout=10) as resp:
