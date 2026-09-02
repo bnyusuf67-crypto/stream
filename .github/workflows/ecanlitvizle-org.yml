@@ -23,8 +23,8 @@ jobs:
 
     - name: Install dependencies
       run: |
-        pip install requests beautifulsoup4 aiohttp
-
+        pip install requests beautifulsoup4 aiohttp lxml
+        
     - name: Create directories
       run: |
         mkdir -p ecanlitvizle-org
