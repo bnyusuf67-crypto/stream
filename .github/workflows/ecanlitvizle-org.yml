@@ -2,7 +2,7 @@ name: Update ecanlitvizle-org
 
 on:
   schedule:
-    - cron: '0 * * * *'  # Her saatte bir çalışır
+    - cron: '0 * * * *'  # Her saatte bir otomatik çalışır
   workflow_dispatch:      # Manuel tetiklemeye izin verir
 
 permissions:
@@ -23,7 +23,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        pip install requests beautifulsoup4
+        pip install requests beautifulsoup4 aiohttp
 
     - name: Create directories
       run: |
