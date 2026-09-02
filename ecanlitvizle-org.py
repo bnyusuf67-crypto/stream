@@ -6,7 +6,6 @@ from html import unescape
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 import aiohttp
-from bs4 import BeautifulSoup
 
 GITHUB_USER = os.getenv("USER_NAME", "bnyusuf67-crypto")
 GITHUB_REPO = os.getenv("REPO_NAME", "stream")
@@ -20,11 +19,20 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
     "Referer": "https://www.ecanlitvizle.live/"
 }
-PATTERN_EMBED = r'"embedUrl": "(.*?)"'
 
-# GitHub Actions sunucusu için maksimum eşzamanlılık sınırı
+# Ağ istek sınırı
 CONCURRENCY_LIMIT = 50
 semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
+
+# Regex Desenleri (HTML parse yerine mikro saniyelik Regex)
+KANAL_PATTERN = re.compile(r'<li>\s*<a\s+href="([^"]+)"\s+title="([^"]+)".*?<img\s+src="([^"]+)"', re.DOTALL)
+EMBED_PATTERN = re.compile(r'"embedUrl":\s*"(.*?)"')
+QUALITY_PATTERN = re.compile(r'["\']#kalite(\d+)["\'].*?changeVideo\(["\']([^"\']+)["\']\)', re.DOTALL)
+FILE_PATTERNS = [
+    re.compile(r"file\s*:\s*['\"]([^'\"]+)['\"]", re.I),
+    re.compile(r"file\s*=\s*['\"]([^'\"]+)['\"]", re.I),
+    re.compile(r"file\s*:\s*&#039;([^&#039;]+)&#039;", re.I)
+]
 
 
 def decode_video_url(encrypted_string: str) -> Optional[str]:
@@ -58,108 +66,61 @@ def decode_video_url(encrypted_string: str) -> Optional[str]:
     for i in range(len(url_chars)):
         if position >= len(cipher_alphabet):
             position = 0
-        cipher_char = cipher_alphabet[position]
-        url_char = url_chars[i]
-        decoded_url = decoded_url.replace(cipher_char, url_char)
+        decoded_url = decoded_url.replace(cipher_alphabet[position], url_chars[i])
         position += 1
 
     return decoded_url
 
 
-def extract_file_from_html(html: str) -> Optional[str]:
-    html = unescape(html)
-    patterns = [
-        r"file\s*:\s*['\"]([^'\"]+)['\"]",
-        r"file\s*:\s*&#039;([^&#039;]+)&#039;",
-        r"file\s*=\s*['\"]([^'\"]+)['\"]",
-        r"'file'\s*:\s*['\"]([^'\"]+)['\"]",
-        r'"file"\s*:\s*["\']([^"\']+)["\']',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, html, re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
+async def fetch_channel_info(session: aiohttp.ClientSession, url: str, name: str, img: str) -> Optional[Dict[str, str]]:
+    """Kanal detayını HTML parse etmeden doğrudan Regex ile çeker."""
+    async with semaphore:
+        try:
+            async with session.get(url, headers=HEADERS, timeout=3) as resp:
+                text = await resp.text()
+                match = EMBED_PATTERN.search(text)
+                if match:
+                    param = match.group(1).replace('\\/', '/').split("=")[-1]
+                    return {"name": name, "img": img, "param": param}
+        except Exception:
+            pass
     return None
 
 
-def extract_quality_options(html: str) -> Dict[str, str]:
-    html = unescape(html)
-    qualities = {}
-    pattern = r'["\']#kalite(\d+)["\'].*?changeVideo\(["\']([^"\']+)["\']\)'
-    matches = re.findall(pattern, html, re.DOTALL)
-    for match in matches:
-        qualities[match[0]] = match[1].strip()
-    return qualities
-
-
-def decode_all_qualities(qualities: Dict[str, str]) -> Dict[str, str]:
-    decoded_qualities = {}
-    for resolution, encoded_url in qualities.items():
-        if 'Äx|Xf|x' in encoded_url:
-            decoded_url = decode_video_url(encoded_url)
-            if decoded_url:
-                decoded_qualities[resolution] = decoded_url
-        else:
-            decoded_qualities[resolution] = encoded_url
-    return decoded_qualities
-
-
-async def fetch_channel_param(session: aiohttp.ClientSession, kanal) -> Optional[Dict[str, str]]:
-    a_tag = kanal.find("a")
-    img_tag = kanal.find("img")
-    if not a_tag or not img_tag:
-        return None
-
-    link = a_tag.get("href")
-    title = a_tag.get("title")
-    img = img_tag.get("src")
-    param = ""
-
-    async with semaphore:
-        try:
-            async with session.get(link, headers=HEADERS, timeout=3) as resp:
-                text = await resp.text()
-                match = re.search(PATTERN_EMBED, text)
-                if match:
-                    param = match.group(1).replace('\\/', '/').split("=")[-1]
-        except Exception:
-            pass
-
-    return {"name": title, "img": img, "param": param} if param else None
-
-
-async def get_ecanlitv(session: aiohttp.ClientSession) -> List[Dict[str, str]]:
-    url = "https://www.ecanlitvizle.live/"
+async def get_all_channels(session: aiohttp.ClientSession) -> List[Dict[str, str]]:
+    """Ana sayfayı ve nav sayfalarını paralel indirip Regex ile kanalları ayıklar."""
+    main_url = "https://www.ecanlitvizle.live/"
     try:
-        async with session.get(url, headers=HEADERS, timeout=4) as resp:
-            content = await resp.text()
-            soup = BeautifulSoup(content, "html.parser")
-    except Exception as e:
-        print(f"Ana sayfa hatası: {e}")
+        async with session.get(main_url, headers=HEADERS, timeout=4) as resp:
+            html = await resp.text()
+    except Exception:
         return []
 
-    tasks = []
-    kanal_liste = soup.find("ul", class_="kanallar")
-    if kanal_liste:
-        for kanal in kanal_liste.find_all("li"):
-            tasks.append(fetch_channel_param(session, kanal))
+    # Sayfalama linklerini Regex ile yakala
+    page_links = list(set(re.findall(r'href="(https://www\.ecanlitvizle\.live/sayfa/\d+/)"', html)))
+    page_links.append(main_url)
 
-    nav = soup.find("div", attrs={"id": "navigation"})
-    if nav:
-        page_links = [p.get("href") for p in nav.find_all("a") if p.get("href")]
-        page_tasks = [session.get(p_url, headers=HEADERS, timeout=3) for p_url in page_links]
-        
-        pages_resp = await asyncio.gather(*page_tasks, return_exceptions=True)
-        for p_resp in pages_resp:
-            if not isinstance(p_resp, Exception) and p_resp.status == 200:
-                p_content = await p_resp.text()
-                p_soup = BeautifulSoup(p_content, "html.parser")
-                p_list = p_soup.find("ul", class_="kanallar")
-                if p_list:
-                    for kanal in p_list.find_all("li"):
-                        tasks.append(fetch_channel_param(session, kanal))
+    # Bütün sayfaları aynı anda indir
+    async def fetch_page(p_url):
+        try:
+            async with session.get(p_url, headers=HEADERS, timeout=3) as r:
+                return await r.text()
+        except Exception:
+            return ""
 
-    results = await asyncio.gather(*tasks)
+    pages_html = await asyncio.gather(*[fetch_page(u) for u in page_links])
+    
+    # Tüm HTML'lerden kanal verilerini topla
+    raw_channels = []
+    for p_html in pages_html:
+        for link, title, img in KANAL_PATTERN.findall(p_html):
+            raw_channels.append((link, title, img))
+
+    # Tekrarlayan kanalları temizle
+    unique_channels = {c[0]: c for c in raw_channels}.values()
+
+    # Kanal parametrelerini paralel çek
+    results = await asyncio.gather(*[fetch_channel_info(session, link, title, img) for link, title, img in unique_channels])
     return [r for r in results if r is not None]
 
 
@@ -168,24 +129,37 @@ async def get_stream_urls(session: aiohttp.ClientSession, param: str, yayin: int
         return None
 
     url = f"https://www.ecanlitvizle.live/embed.php?kanal={param}&yayin={yayin}"
-    
     async with semaphore:
         try:
             async with session.get(url, headers=HEADERS, timeout=3) as resp:
                 if resp.status != 200:
                     return await get_stream_urls(session, param, yayin + 1)
 
-                html_content = await resp.text()
-                streams = extract_quality_options(html_content)
-                decoded_streams = list(decode_all_qualities(streams).values())
+                html_content = unescape(await resp.text())
+                
+                # Kalite opsiyonlarını çöz
+                qualities = {}
+                for res, enc_url in QUALITY_PATTERN.findall(html_content):
+                    qualities[res] = enc_url.strip()
 
-                if not streams:
-                    stream = extract_file_from_html(html_content)
-                    if stream:
-                        decoded_stream = decode_video_url(stream) if 'Äx|Xf|x' in stream else stream
-                        decoded_streams.append(decoded_stream)
+                decoded_streams = []
+                for enc_url in qualities.values():
+                    if 'Äx|Xf|x' in enc_url:
+                        d_url = decode_video_url(enc_url)
+                        if d_url: decoded_streams.append(d_url)
+                    else:
+                        decoded_streams.append(enc_url)
 
-                if decoded_streams and decoded_streams[0] and DOMAIN in decoded_streams[0]:
+                if not decoded_streams:
+                    for pat in FILE_PATTERNS:
+                        m = pat.search(html_content)
+                        if m:
+                            stream = m.group(1).strip()
+                            decoded_stream = decode_video_url(stream) if 'Äx|Xf|x' in stream else stream
+                            decoded_streams.append(decoded_stream)
+                            break
+
+                if decoded_streams and DOMAIN in decoded_streams[0]:
                     return decoded_streams
                 else:
                     return await get_stream_urls(session, param, yayin + 1)
@@ -194,7 +168,6 @@ async def get_stream_urls(session: aiohttp.ClientSession, param: str, yayin: int
 
 
 def fast_save_file(path: str, streams: List[str]):
-    """Yayın dosyasını ağı tekrar meşgul etmeden anında diske yazar."""
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write("#EXTM3U\n#EXT-X-VERSION:3\n")
@@ -226,26 +199,22 @@ async def process_channel(session: aiohttp.ClientSession, kanal: Dict[str, str],
 
 
 async def main():
-    # TCP soketlerini açık tutarak ağ gecikmesini yok eder
-    connector = aiohttp.TCPConnector(limit=200, limit_per_host=50, ttl_dns_cache=300)
-    
+    connector = aiohttp.TCPConnector(limit=300, limit_per_host=100, ttl_dns_cache=300)
     async with aiohttp.ClientSession(connector=connector) as session:
-        kanallar = await get_ecanlitv(session)
-        
+        kanallar = await get_all_channels(session)
+
         shutil.rmtree(FILE_NAME, ignore_errors=True)
         os.makedirs(FILE_NAME, exist_ok=True)
         os.makedirs("playlists", exist_ok=True)
 
         playlist_lines = ["#EXTM3U\n"]
-        
-        # Tüm kanalları aynı anda çözümler
         await asyncio.gather(*[process_channel(session, kanal, playlist_lines) for kanal in kanallar])
 
         playlist_file_path = os.path.join("playlists", f"{FILE_NAME}.m3u")
         with open(playlist_file_path, "w", encoding="utf-8") as f:
             f.writelines(playlist_lines)
 
-        print("Tamamlandı!")
+        print("Süreç tamamlandı.")
 
 
 if __name__ == "__main__":
