@@ -9,8 +9,8 @@ import aiohttp
 from bs4 import BeautifulSoup
 
 # Environment Değişkenleri
-GITHUB_USER = os.getenv("USER_NAME", "username")
-GITHUB_REPO = os.getenv("REPO_NAME", "repo")
+GITHUB_USER = os.getenv("USER_NAME", "bnyusuf67-crypto")
+GITHUB_REPO = os.getenv("REPO_NAME", "stream")
 GITHUB_BRANCH = os.getenv("BRANCH_NAME", "main")
 
 FILE_NAME = "ecanlitvizle-org"
