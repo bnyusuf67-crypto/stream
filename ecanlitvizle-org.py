@@ -8,7 +8,6 @@ from urllib.parse import urlparse
 import aiohttp
 from bs4 import BeautifulSoup
 
-# Environment Değişkenleri
 GITHUB_USER = os.getenv("USER_NAME", "bnyusuf67-crypto")
 GITHUB_REPO = os.getenv("REPO_NAME", "stream")
 GITHUB_BRANCH = os.getenv("BRANCH_NAME", "main")
@@ -23,8 +22,8 @@ HEADERS = {
 }
 PATTERN_EMBED = r'"embedUrl": "(.*?)"'
 
-# Eşzamanlı istek sınırı (Sunucuyu yormadan maksimum hız için 25 idealdir)
-CONCURRENCY_LIMIT = 25
+# GitHub Actions sunucusu için maksimum eşzamanlılık sınırı
+CONCURRENCY_LIMIT = 50
 semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
 
@@ -106,7 +105,6 @@ def decode_all_qualities(qualities: Dict[str, str]) -> Dict[str, str]:
 
 
 async def fetch_channel_param(session: aiohttp.ClientSession, kanal) -> Optional[Dict[str, str]]:
-    """Kanal detay sayfasına paralel gidip embed parametresini çeker."""
     a_tag = kanal.find("a")
     img_tag = kanal.find("img")
     if not a_tag or not img_tag:
@@ -119,22 +117,21 @@ async def fetch_channel_param(session: aiohttp.ClientSession, kanal) -> Optional
 
     async with semaphore:
         try:
-            async with session.get(link, headers=HEADERS, timeout=5) as resp:
+            async with session.get(link, headers=HEADERS, timeout=3) as resp:
                 text = await resp.text()
                 match = re.search(PATTERN_EMBED, text)
                 if match:
                     param = match.group(1).replace('\\/', '/').split("=")[-1]
-        except Exception as e:
-            print(f"Kanal detay hatası ({title}): {e}")
+        except Exception:
+            pass
 
-    return {"name": title, "img": img, "param": param}
+    return {"name": title, "img": img, "param": param} if param else None
 
 
 async def get_ecanlitv(session: aiohttp.ClientSession) -> List[Dict[str, str]]:
-    """Tüm kanalları ve sayfaları eşzamanlı/paralel olarak çeker."""
     url = "https://www.ecanlitvizle.live/"
     try:
-        async with session.get(url, headers=HEADERS, timeout=5) as resp:
+        async with session.get(url, headers=HEADERS, timeout=4) as resp:
             content = await resp.text()
             soup = BeautifulSoup(content, "html.parser")
     except Exception as e:
@@ -147,11 +144,10 @@ async def get_ecanlitv(session: aiohttp.ClientSession) -> List[Dict[str, str]]:
         for kanal in kanal_liste.find_all("li"):
             tasks.append(fetch_channel_param(session, kanal))
 
-    # Sayfaları sıralı değil, paralel isteklerle topluyoruz
     nav = soup.find("div", attrs={"id": "navigation"})
     if nav:
         page_links = [p.get("href") for p in nav.find_all("a") if p.get("href")]
-        page_tasks = [session.get(p_url, headers=HEADERS, timeout=5) for p_url in page_links]
+        page_tasks = [session.get(p_url, headers=HEADERS, timeout=3) for p_url in page_links]
         
         pages_resp = await asyncio.gather(*page_tasks, return_exceptions=True)
         for p_resp in pages_resp:
@@ -171,12 +167,11 @@ async def get_stream_urls(session: aiohttp.ClientSession, param: str, yayin: int
     if yayin > 3 or not param:
         return None
 
-    # Güncellenmiş alan adı kullanımı
     url = f"https://www.ecanlitvizle.live/embed.php?kanal={param}&yayin={yayin}"
     
     async with semaphore:
         try:
-            async with session.get(url, headers=HEADERS, timeout=5) as resp:
+            async with session.get(url, headers=HEADERS, timeout=3) as resp:
                 if resp.status != 200:
                     return await get_stream_urls(session, param, yayin + 1)
 
@@ -194,55 +189,36 @@ async def get_stream_urls(session: aiohttp.ClientSession, param: str, yayin: int
                     return decoded_streams
                 else:
                     return await get_stream_urls(session, param, yayin + 1)
-        except Exception as e:
-            print(f"Yayın hatası ({param}): {e}")
+        except Exception:
             return None
 
 
-async def save_file(session: aiohttp.ClientSession, path: str, streams: List[str]) -> bool:
+def fast_save_file(path: str, streams: List[str]):
+    """Yayın dosyasını ağı tekrar meşgul etmeden anında diske yazar."""
     try:
-        if len(streams) == 1:
-            url = streams[0]
-            async with session.get(url, headers=HEADERS, timeout=5) as resp:
-                if resp.status != 200:
-                    return False
-                text = await resp.text()
-
-            with open(path, "w", encoding="utf-8") as f:
-                if "EXT-X-STREAM-INF" in text:
-                    base_url = url.rsplit("/", 1)[0]
-                    for line in text.splitlines():
-                        if not line.startswith("#") and "http" not in line:
-                            line = f"{base_url}/{line}"
-                        f.write(f"{line}\n")
-                else:
-                    f.write("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=800000\n")
-                    f.write(f"{url}\n")
-
-        elif len(streams) > 1:
-            bw_list = ["800000", "1200000", "1800000", "2500000", "3000000"]
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("#EXTM3U\n")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("#EXTM3U\n#EXT-X-VERSION:3\n")
+            if len(streams) == 1:
+                f.write("#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=800000\n")
+                f.write(f"{streams[0]}\n")
+            else:
+                bw_list = ["800000", "1200000", "1800000", "2500000", "3000000"]
                 for i, url in enumerate(streams):
                     bw = bw_list[i] if i < len(bw_list) else "3000000"
                     f.write(f"#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH={bw}\n{url}\n")
         return True
-    except Exception as e:
-        print(f"Dosya kaydetme hatası ({path}): {e}")
+    except Exception:
         return False
 
 
 async def process_channel(session: aiohttp.ClientSession, kanal: Dict[str, str], playlist_lines: List[str]):
-    if not kanal["param"]:
-        return
-
     stream_urls = await get_stream_urls(session, kanal['param'])
     if stream_urls:
         channel_slug = urlparse(stream_urls[0]).path.split('/')[-1].split('.')[0].replace("-master", "")
         file_name = f"{channel_slug}.m3u8"
         file_path = os.path.join(FILE_NAME, file_name)
 
-        if await save_file(session, file_path, stream_urls):
+        if fast_save_file(file_path, stream_urls):
             github_url = f"{BASE_URL}/{FILE_NAME}/{file_name}"
             playlist_lines.append(f'#EXTINF:-1 tvg-id="" tvg-name="{kanal["name"]}" tvg-logo="{kanal["img"]}",{kanal["name"]}\n')
             playlist_lines.append(f"#EXTVLCOPT:http-user-agent={HEADERS['User-Agent']}\n")
@@ -250,27 +226,26 @@ async def process_channel(session: aiohttp.ClientSession, kanal: Dict[str, str],
 
 
 async def main():
-    # Yüksek havuz kapasiteli TCP Connector (Paralel bağlantı darboğazlarını çözer)
-    connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
+    # TCP soketlerini açık tutarak ağ gecikmesini yok eder
+    connector = aiohttp.TCPConnector(limit=200, limit_per_host=50, ttl_dns_cache=300)
     
     async with aiohttp.ClientSession(connector=connector) as session:
-        print("Kanallar taranıyor...")
         kanallar = await get_ecanlitv(session)
-        print(f"Toplam {len(kanallar)} kanal bulundu. Yayın bağlantıları çözümleniyor...")
-
+        
         shutil.rmtree(FILE_NAME, ignore_errors=True)
         os.makedirs(FILE_NAME, exist_ok=True)
         os.makedirs("playlists", exist_ok=True)
 
         playlist_lines = ["#EXTM3U\n"]
-        tasks = [process_channel(session, kanal, playlist_lines) for kanal in kanallar]
-        await asyncio.gather(*tasks)
+        
+        # Tüm kanalları aynı anda çözümler
+        await asyncio.gather(*[process_channel(session, kanal, playlist_lines) for kanal in kanallar])
 
         playlist_file_path = os.path.join("playlists", f"{FILE_NAME}.m3u")
         with open(playlist_file_path, "w", encoding="utf-8") as f:
             f.writelines(playlist_lines)
 
-        print("Tüm işlemler başarıyla tamamlandı!")
+        print("Tamamlandı!")
 
 
 if __name__ == "__main__":
