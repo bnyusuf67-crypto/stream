@@ -19,12 +19,13 @@ HEADERS = {
     "Referer": "https://www.ecanlitvizle.live/"
 }
 
-# Ağ bağlantı sınırı ve sıkı zaman aşımı (Timeout)
-CONCURRENCY_LIMIT = 20
+# Sunucuyu kilitlememek için eşzamanlı kanal işleme sınırı
+CONCURRENCY_LIMIT = 15
 semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-TIMEOUT = aiohttp.ClientTimeout(total=1.2)
 
-# Regex Kalıpları
+# Kanal başı maksimum yeniden deneme sayısı
+MAX_RETRIES = 3
+
 KANAL_PATTERN = re.compile(r'<li>\s*<a\s+href="https://www\.ecanlitvizle\.live/([^"]+)-canli-izle/?(?:\d+)?"\s+title="([^"]+)".*?<img\s+src="([^"]+)"', re.DOTALL)
 QUALITY_PATTERN = re.compile(r'["\']#kalite(\d+)["\'].*?changeVideo\(["\']([^"\']+)["\']\)', re.DOTALL)
 FILE_PATTERN = re.compile(r"file\s*:\s*['\"]([^'\"]+)['\"]", re.I)
@@ -67,31 +68,40 @@ def decode_video_url(encrypted_string: str) -> Optional[str]:
 
 
 async def get_all_channels(session: aiohttp.ClientSession) -> List[Dict[str, str]]:
-    """Tek bir istekle tüm ana ve kategori sayfalarındaki kanalları çeker, slug'ları parametreye dönüştürür."""
     main_url = "https://www.ecanlitvizle.live/"
-    try:
-        async with session.get(main_url, headers=HEADERS, timeout=TIMEOUT) as resp:
-            html = await resp.text()
-    except Exception:
+    
+    # Ana sayfa gelene kadar tekrar dener
+    html = ""
+    for _ in range(MAX_RETRIES):
+        try:
+            async with session.get(main_url, headers=HEADERS) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+                    break
+        except Exception:
+            await asyncio.sleep(0.5)
+
+    if not html:
         return []
 
-    # Sayfalama linklerini yakala
     page_links = list(set(re.findall(r'href="(https://www\.ecanlitvizle\.live/sayfa/\d+/)"', html)))
     page_links.append(main_url)
 
     async def fetch_page(p_url):
-        try:
-            async with session.get(p_url, headers=HEADERS, timeout=TIMEOUT) as r:
-                return await r.text()
-        except Exception:
-            return ""
+        for _ in range(MAX_RETRIES):
+            try:
+                async with session.get(p_url, headers=HEADERS) as r:
+                    if r.status == 200:
+                        return await r.text()
+            except Exception:
+                await asyncio.sleep(0.3)
+        return ""
 
     pages_html = await asyncio.gather(*[fetch_page(u) for u in page_links])
     
     channels = {}
     for p_html in pages_html:
         for slug, title, img in KANAL_PATTERN.findall(p_html):
-            # slug doğrudan 'param' olarak kullanılır (örn: 'kanal-d')
             clean_param = slug.strip('/')
             if clean_param not in channels:
                 channels[clean_param] = {
@@ -103,38 +113,51 @@ async def get_all_channels(session: aiohttp.ClientSession) -> List[Dict[str, str
     return list(channels.values())
 
 
-async def get_stream_urls(session: aiohttp.ClientSession, param: str) -> Optional[List[str]]:
-    """Detay sayfasına hiç uğramadan doğrudan embed kaynağına istek atar."""
-    url = f"https://www.ecanlitvizle.live/embed.php?kanal={param}&yayin=1"
-    async with semaphore:
+async def fetch_embed_with_retry(session: aiohttp.ClientSession, param: str, yayin: int) -> Optional[List[str]]:
+    """Belirli bir yayın alternatifini (yayin=1,2,3) başarılı olana kadar dener."""
+    url = f"https://www.ecanlitvizle.live/embed.php?kanal={param}&yayin={yayin}"
+    
+    for attempt in range(MAX_RETRIES):
         try:
-            async with session.get(url, headers=HEADERS, timeout=TIMEOUT) as resp:
-                if resp.status != 200:
-                    return None
+            async with session.get(url, headers=HEADERS) as resp:
+                if resp.status == 200:
+                    html_content = await resp.text()
+                    qualities = dict(QUALITY_PATTERN.findall(html_content))
 
-                html_content = await resp.text()
-                qualities = dict(QUALITY_PATTERN.findall(html_content))
+                    decoded_streams = []
+                    for enc_url in qualities.values():
+                        enc_url = enc_url.strip()
+                        if 'Äx|Xf|x' in enc_url:
+                            d_url = decode_video_url(enc_url)
+                            if d_url: decoded_streams.append(d_url)
+                        else:
+                            decoded_streams.append(enc_url)
 
-                decoded_streams = []
-                for enc_url in qualities.values():
-                    enc_url = enc_url.strip()
-                    if 'Äx|Xf|x' in enc_url:
-                        d_url = decode_video_url(enc_url)
-                        if d_url: decoded_streams.append(d_url)
-                    else:
-                        decoded_streams.append(enc_url)
+                    if not decoded_streams:
+                        match = FILE_PATTERN.search(html_content)
+                        if match:
+                            stream = match.group(1).strip()
+                            decoded_stream = decode_video_url(stream) if 'Äx|Xf|x' in stream else stream
+                            decoded_streams.append(decoded_stream)
 
-                if not decoded_streams:
-                    match = FILE_PATTERN.search(html_content)
-                    if match:
-                        stream = match.group(1).strip()
-                        decoded_stream = decode_video_url(stream) if 'Äx|Xf|x' in stream else stream
-                        decoded_streams.append(decoded_stream)
-
-                if decoded_streams and DOMAIN in decoded_streams[0]:
-                    return decoded_streams
+                    if decoded_streams and DOMAIN in decoded_streams[0]:
+                        return decoded_streams
         except Exception:
             pass
+        
+        # İstek başarısız olursa kısa bir süre bekleyip tekrar dener
+        await asyncio.sleep(0.5)
+
+    return None
+
+
+async def get_stream_urls(session: aiohttp.ClientSession, param: str) -> Optional[List[str]]:
+    """Yayın 1'den başlayarak alternatif yayınları sırayla dener, bulduğu ilk çalışan akışı döndürür."""
+    async with semaphore:
+        for yayin_no in [1, 2, 3]:
+            streams = await fetch_embed_with_retry(session, param, yayin_no)
+            if streams:
+                return streams
     return None
 
 
